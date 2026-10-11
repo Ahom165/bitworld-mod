@@ -93,6 +93,83 @@ class WorldSyncTest {
         }
     }
 
+    // ===== voie d'écriture (pose de blocs -> bits à 1) =====
+
+    @Test
+    void computeWritesFindsPlacedPaletteBlocks() throws IOException {
+        // fichier 0x00 : le joueur pose de la glowstone aux bits 0, 2 et 7
+        try (BitStore store = storeWith(new byte[]{(byte) 0x00})) {
+            List<Long> writes = WorldSync.computeWrites(store,
+                    (x, y, z) -> y == BitLayout.BASE_Y && z == 0 && (x == 0 || x == 2 || x == 7));
+            assertEquals(List.of(0L, 2L, 7L), writes);
+            for (long bit : writes) {
+                store.setBit(bit);
+            }
+            // relecture FRAÎCHE depuis le disque : l'écriture doit être physiquement là
+            byte[] onDisk = Files.readAllBytes(dir.resolve("a.bin"));
+            assertEquals((byte) 0b1000_0101, onDisk[0]);
+        }
+    }
+
+    @Test
+    void computeWritesIgnoresBitsAlreadyOne() throws IOException {
+        // tous les bits déjà à 1 : conforme, rien à écrire
+        try (BitStore store = storeWith(new byte[]{(byte) 0b1111_1111})) {
+            List<Long> writes = WorldSync.computeWrites(store, (x, y, z) -> true);
+            assertTrue(writes.isEmpty());
+        }
+    }
+
+    @Test
+    void computeWritesIgnoresPositionsWithoutPalette() throws IOException {
+        // des positions vides de blocs palette (terre cassée, TNT posée...) : rien à écrire
+        try (BitStore store = storeWith(new byte[]{(byte) 0x00})) {
+            List<Long> writes = WorldSync.computeWrites(store, (x, y, z) -> false);
+            assertTrue(writes.isEmpty());
+        }
+    }
+
+    @Test
+    void placementWritesFilesPhysicallyWithBackup() throws IOException {
+        Files.write(dir.resolve("a.bin"), new byte[]{(byte) 0x00});
+        try (BitStore store = new BitStore(dir)) {
+            BitLayout.configure(store.totalBits());
+            List<Long> writes = WorldSync.computeWrites(store,
+                    (x, y, z) -> y == BitLayout.BASE_Y && x == 3 && z == 0);
+            assertEquals(List.of(3L), writes);
+            store.setBit(3);
+            byte[] onDisk = Files.readAllBytes(dir.resolve("a.bin"));
+            assertEquals((byte) 0b0000_1000, onDisk[0]);
+            assertEquals(1, store.entries().get(0).popcount());
+            // comme pour l'effacement, le .bak de l'original doit exister
+            assertTrue(Files.exists(dir.resolve("a.bin.bak")));
+            assertArrayEquals(new byte[]{(byte) 0x00}, Files.readAllBytes(dir.resolve("a.bin.bak")));
+        }
+    }
+
+    @Test
+    void writesAndCorrectionsAreSymmetric() throws IOException {
+        // propriété clé : tout bit écrit par une pose peut être effacé par la
+        // destruction — les deux passes sont des inverses exacts
+        byte start = (byte) 0b0101_0010; // bits 1, 4, 6 déjà à 1
+        try (BitStore store = storeWith(new byte[]{start})) {
+            // pose de palette sur les positions des bits 0, 3 et 7 (actuellement à 0)
+            List<Long> writes = WorldSync.computeWrites(store,
+                    (x, y, z) -> y == BitLayout.BASE_Y && z == 0 && (x == 0 || x == 3 || x == 7));
+            assertEquals(List.of(0L, 3L, 7L), writes);
+            for (long bit : writes) {
+                store.setBit(bit);
+            }
+            // maintenant tout est détruit : les corrections retrouvent TOUS les bits à 1
+            List<Long> corrections = WorldSync.computeCorrections(store, (x, y, z) -> true);
+            assertEquals(List.of(0L, 1L, 3L, 4L, 6L, 7L), corrections);
+            for (long bit : corrections) {
+                store.clearBit(bit);
+            }
+            assertEquals(0, Files.readAllBytes(dir.resolve("a.bin"))[0]);
+        }
+    }
+
     @Test
     void fullExplosionScenario() throws IOException {
         // simulation bout-en-bout : 4 octets (couches BASE_Y..BASE_Y+3),
